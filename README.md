@@ -26,7 +26,22 @@ This is a suite of tools/PoCs/exploits that can be used with any camera that use
 
 [[7] But can it run DOOM?](https://luke-m.xyz/camera/p8.md)
 
+## Install Requirements (Ubuntu)
+
+- `python3 -m venv .venv`
+- `pip install pwntools`
+- `sudo apt install gcc-arm-none-eabi binutils-arm-none-eabi`
+- `sudo apt install gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi`
+
 ## Functionality
+
+## `doom`
+
+This runs through the entire process from start to finish of uploading necessary files, getting code execution with OOB-read and stack overflow, runs doom using command injection, and consequently overwrites the stream with doom running locally on the camera (before the hardware encoder).
+
+*Note*: Run `make` in the doom directory to clone the `doomgeneric` repo, it will copy the new files for the camera into this, build the `doom` binary, and copy it to the doom directory to be used.
+
+![alt text](images/doom.gif)
 
 ### `ap_bind`
 
@@ -265,9 +280,4 @@ python3 yihaw.py hijack wargames
 
 ![alt text](images/wargames.jpg)
 
-## `doom`
-
-This runs through the entire process from start to finish of uploading necessary files, getting code execution with OOB-read and stack overflow, runs doom using command injection, and consequently overwrites the stream with doom running locally on the camera (before the hardware encoder).
-
-![alt text](images/doom.gif)
 

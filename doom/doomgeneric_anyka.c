@@ -3,15 +3,13 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/time.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <fcntl.h>
-#include <stdio.h>
 #include <stdint.h>
 #include <time.h>
 
@@ -23,6 +21,12 @@
 #define KEY_STATUS_SIZE 8
 
 #define KEYQUEUE_SIZE 16
+
+#define INPUT_WIDTH   320
+#define INPUT_HEIGHT  200
+#define OUTPUT_WIDTH  640
+#define OUTPUT_HEIGHT 360
+#define OUTPUT_TOTAL  (OUTPUT_WIDTH * OUTPUT_HEIGHT)
 
 static unsigned short s_KeyQueue[KEYQUEUE_SIZE];
 static unsigned int s_KeyQueueWriteIndex = 0;
@@ -39,262 +43,216 @@ typedef enum {
     ANYKA_ENTER
 } ANYKA_DOOM_KEY;
 
-char *shared_yuv_buffer;
-char *key_status;
-char *last_key_status;
+static char *shared_yuv_buffer;
+static char *key_status;
+static char *last_key_status;
 
-uint8_t y_lookup_red[256];
-uint8_t y_lookup_green[256];
-uint8_t y_lookup_blue[256];
-uint8_t u_lookup_red[256];
-uint8_t u_lookup_green[256];
-uint8_t u_lookup_blue[256];
-uint8_t v_lookup_red[256];
-uint8_t v_lookup_green[256];
-uint8_t v_lookup_blue[256];
+// Frame-ready eventfd: consumer blocks on read(), producer write()s 1 after each frame
+static int frame_ready_fd = -1;
 
-// Function to precompute lookup tables
-void precomputeLookupTables() {
-    const double kr = 0.299;
-    const double kg = 0.587;
-    const double kb = 0.114;
+// --- Lookup tables ---
 
+// Y channel (positive contributions)
+static uint8_t y_lookup_red[256];
+static uint8_t y_lookup_green[256];
+static uint8_t y_lookup_blue[256];
+
+// U channel: new_u = 128 - u_neg_red[r] - u_neg_green[g] + u_pos_blue[b]
+static uint8_t u_neg_lookup_red[256];
+static uint8_t u_neg_lookup_green[256];
+static uint8_t u_pos_lookup_blue[256];
+
+// V channel: new_v = 128 + v_pos_red[r] - v_neg_green[g] - v_neg_blue[b]
+static uint8_t v_pos_lookup_red[256];
+static uint8_t v_neg_lookup_green[256];
+static uint8_t v_neg_lookup_blue[256];
+
+// Precomputed Y-axis input row mapping for the 200->360 scale (non-power-of-2)
+static int y_row_map[OUTPUT_HEIGHT];
+
+static void precomputeLookupTables(void)
+{
     for (int i = 0; i < 256; ++i) {
-        y_lookup_red[i] = (uint8_t) (0.299 * i);
-        y_lookup_green[i] = (uint8_t) (0.587 * i);
-        y_lookup_blue[i] = (uint8_t) (0.114 * i);
-        u_lookup_red[i] = (uint8_t) (0.147 * i);
-        u_lookup_green[i] = (uint8_t) (0.289 * i);
-        u_lookup_blue[i] = (uint8_t) (0.436 * i);
-        v_lookup_red[i] = (uint8_t) (0.615 * i);
-        v_lookup_green[i] = (uint8_t) (0.515 * i);
-        v_lookup_blue[i] = (uint8_t) (0.1 * i);
+        y_lookup_red[i]   = (uint8_t)(0.299 * i);
+        y_lookup_green[i] = (uint8_t)(0.587 * i);
+        y_lookup_blue[i]  = (uint8_t)(0.114 * i);
+
+        // U: 128 - 0.147r - 0.289g + 0.436b
+        u_neg_lookup_red[i]   = (uint8_t)(0.147 * i);
+        u_neg_lookup_green[i] = (uint8_t)(0.289 * i);
+        u_pos_lookup_blue[i]  = (uint8_t)(0.436 * i);
+
+        // V: 128 + 0.615r - 0.515g - 0.100b
+        v_pos_lookup_red[i]   = (uint8_t)(0.615 * i);
+        v_neg_lookup_green[i] = (uint8_t)(0.515 * i);
+        v_neg_lookup_blue[i]  = (uint8_t)(0.100 * i);
+    }
+
+    // Precompute the Y-axis row mapping (OUTPUT_HEIGHT -> INPUT_HEIGHT)
+    // Avoids the multiply+divide per pixel for the non-power-of-2 Y scale
+    for (int i = 0; i < OUTPUT_HEIGHT; ++i) {
+        y_row_map[i] = (i * INPUT_HEIGHT / OUTPUT_HEIGHT) * INPUT_WIDTH;
     }
 }
 
 static unsigned char convertToDoomKey(unsigned int key)
 {
-	switch (key)
-	{
-    case ANYKA_ENTER:
-      key = KEY_ENTER;
-      break;
-    case ANYKA_ESCAPE:
-      key = KEY_ESCAPE;
-      break;
-    case ANYKA_LEFT:
-      key = KEY_LEFTARROW;
-      break;
-    case ANYKA_RIGHT:
-      key = KEY_RIGHTARROW;
-      break;
-    case ANYKA_FORWARD:
-      key = KEY_UPARROW;
-      break;
-    case ANYKA_BACKWARD:
-      key = KEY_DOWNARROW;
-      break;
-    case ANYKA_FIRE:
-      key = KEY_FIRE;
-      break;
-    case ANYKA_USE:
-      key = KEY_USE;
-      break;
-    default:
-      key = tolower(key);
-      break;
-	}
-
-	return key;
+    switch (key) {
+    case ANYKA_ENTER:    return KEY_ENTER;
+    case ANYKA_ESCAPE:   return KEY_ESCAPE;
+    case ANYKA_LEFT:     return KEY_LEFTARROW;
+    case ANYKA_RIGHT:    return KEY_RIGHTARROW;
+    case ANYKA_FORWARD:  return KEY_UPARROW;
+    case ANYKA_BACKWARD: return KEY_DOWNARROW;
+    case ANYKA_FIRE:     return KEY_FIRE;
+    case ANYKA_USE:      return KEY_USE;
+    default:             return tolower(key);
+    }
 }
 
 static void addKeyToQueue(int pressed, unsigned int keyCode)
 {
-	unsigned char key = convertToDoomKey(keyCode);
-
-	unsigned short keyData = (pressed << 8) | key;
-
-	s_KeyQueue[s_KeyQueueWriteIndex] = keyData;
-	s_KeyQueueWriteIndex++;
-	s_KeyQueueWriteIndex %= KEYQUEUE_SIZE;
+    unsigned char key = convertToDoomKey(keyCode);
+    unsigned short keyData = (pressed << 8) | key;
+    s_KeyQueue[s_KeyQueueWriteIndex] = keyData;
+    s_KeyQueueWriteIndex = (s_KeyQueueWriteIndex + 1) % KEYQUEUE_SIZE;
 }
 
-int DG_GetKey(int* pressed, unsigned char* doomKey)
+int DG_GetKey(int *pressed, unsigned char *doomKey)
 {
-	if (s_KeyQueueReadIndex == s_KeyQueueWriteIndex)
-	{
-		//key queue is empty
+    if (s_KeyQueueReadIndex == s_KeyQueueWriteIndex)
+        return 0;
 
-		return 0;
-	}
-	else
-	{
-		unsigned short keyData = s_KeyQueue[s_KeyQueueReadIndex];
-		s_KeyQueueReadIndex++;
-		s_KeyQueueReadIndex %= KEYQUEUE_SIZE;
-
-		*pressed = keyData >> 8;
-		*doomKey = keyData & 0xFF;
-
-		return 1;
-	}
+    unsigned short keyData = s_KeyQueue[s_KeyQueueReadIndex];
+    s_KeyQueueReadIndex = (s_KeyQueueReadIndex + 1) % KEYQUEUE_SIZE;
+    *pressed = keyData >> 8;
+    *doomKey = keyData & 0xFF;
+    return 1;
 }
 
-void DG_Init()
+static int open_shared_file(const char *path, size_t size)
+{
+    int fd = open(path, O_CREAT | O_RDWR, 0666);
+    if (fd == -1) { perror("open"); exit(1); }
+    if (ftruncate(fd, size) == -1) { perror("ftruncate"); exit(1); }
+    return fd;
+}
+
+static char *map_shared(int fd, size_t size)
+{
+    char *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) { perror("mmap"); exit(1); }
+    return ptr;
+}
+
+void DG_Init(void)
 {
     printf("Initing!\n");
     precomputeLookupTables();
 
     int fd;
 
-    // initialise the shared yuv data buffer
-    fd = open(YUV_BUFFER_FILENAME, O_CREAT | O_RDWR, 0666);
-    if (fd == -1) {
-        perror("open");
-        exit(1);
-    }
+    fd = open_shared_file(YUV_BUFFER_FILENAME, YUV_BUFFER_SIZE);
+    shared_yuv_buffer = map_shared(fd, YUV_BUFFER_SIZE);
+    close(fd);
 
-    if (ftruncate(fd, YUV_BUFFER_SIZE) == -1) {
-        perror("ftruncate");
-        exit(1);
-    }
+    fd = open_shared_file(KEY_STATUS_FILENAME, KEY_STATUS_SIZE);
+    key_status = map_shared(fd, KEY_STATUS_SIZE);
+    close(fd);
 
-    // Map the yuv buffer into memory
-    shared_yuv_buffer = mmap(NULL, YUV_BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (shared_yuv_buffer == MAP_FAILED) {
-        perror("mmap");
-        exit(1);
-    }
+    last_key_status = calloc(KEY_STATUS_SIZE, sizeof(uint8_t));
+    if (!last_key_status) { perror("calloc"); exit(1); }
 
-    last_key_status = (char*) calloc(KEY_STATUS_SIZE, sizeof(uint8_t));
-
-    // now initialise the shared key buffer in a similar way
-    // initialise the shared yuv data buffer
-    fd = open(KEY_STATUS_FILENAME, O_CREAT | O_RDWR, 0666);
-    if (fd == -1) {
-        perror("open");
-        exit(1);
-    }
-
-    if (ftruncate(fd, KEY_STATUS_SIZE) == -1) {
-        perror("ftruncate");
-        exit(1);
-    }
-
-    // Map the yuv buffer into memory
-    key_status = mmap(NULL, KEY_STATUS_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (key_status == MAP_FAILED) {
-        perror("mmap");
-        exit(1);
-    }
+    // Create the frame-ready eventfd
+    frame_ready_fd = eventfd(0, EFD_NONBLOCK);
+    if (frame_ready_fd == -1) { perror("eventfd"); exit(1); }
 }
 
-void DG_DrawFrame() {
-    int input_height = 200;
-    int output_height = 360;
-    int input_width = 320;
-    int output_width = 640;
+void DG_DrawFrame(void)
+{
+    uint8_t *yuv = (uint8_t *)shared_yuv_buffer;
+    uint8_t *U_plane = yuv + OUTPUT_TOTAL;
+    uint8_t *V_plane = yuv + OUTPUT_TOTAL + OUTPUT_TOTAL / 4;
 
-    int output_total = output_width * output_height;
+    // Process pairs of rows so each 2x2 output block maps to one input pixel.
+    // Stride in output UV plane is OUTPUT_WIDTH/2.
+    for (int i = 0; i < OUTPUT_HEIGHT; i += 2) {
+        // Precomputed input row offset — both output rows sample from the same input row
+        const int in_row0 = y_row_map[i];
 
-    // Variables to measure time
-    struct timespec start_time, end_time;
-    uint32_t time_to_draw;
+        uint8_t *Y_row0 = yuv + i * OUTPUT_WIDTH;
+        uint8_t *Y_row1 = yuv + (i + 1) * OUTPUT_WIDTH;
+        uint8_t *U_row  = U_plane + (i / 2) * (OUTPUT_WIDTH / 2);
+        uint8_t *V_row  = V_plane + (i / 2) * (OUTPUT_WIDTH / 2);
 
-    // Record start time
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
+        for (int j = 0; j < OUTPUT_WIDTH; j += 2) {
+            // X scale is exactly 2x, so right-shift suffices.
+            // x_input is also used as the UV index (both are j/2).
+            const int x_input = j >> 1;
 
-    // Upscale DG_ScreenBuffer to 640x360 and store it in shared_yuv_buffer
-    for (int i = 0; i < output_height; i+=2) {
-        for (int j = 0; j < output_width; j+=2) {
-            // Mapping coordinates from output to input
-            int x_input = j * input_width / output_width;
-            int y_input = i * input_height / output_height;
+            // Sample one input pixel for the 2x2 output block (nearest-neighbour)
+            const uint32_t px = DG_ScreenBuffer[in_row0 + x_input];
+            const uint8_t r = (uint8_t)(px >> 16);
+            const uint8_t g = (uint8_t)(px >>  8);
+            const uint8_t b = (uint8_t)(px);
 
-            // Accessing pixel in the input buffer
-            uint32_t centerPixel = DG_ScreenBuffer[y_input * input_width + x_input];
+            // Y (luma) — write 4 pixels across two adjacent rows
+            const uint8_t luma = y_lookup_red[r] + y_lookup_green[g] + y_lookup_blue[b];
+            Y_row0[j]     = luma;
+            Y_row0[j + 1] = luma;
+            Y_row1[j]     = luma;
+            Y_row1[j + 1] = luma;
 
-            uint8_t red = centerPixel >> 16;
-            uint8_t green = centerPixel >> 8;
-            uint8_t blue = centerPixel;
-
-            uint8_t new_y = y_lookup_red[red] + y_lookup_green[green] + y_lookup_blue[blue];
-            shared_yuv_buffer[i * output_width + j] = new_y;
-            shared_yuv_buffer[(i+1) * output_width + j] = new_y;
-            shared_yuv_buffer[i * output_width + (j+1)] = new_y;
-            shared_yuv_buffer[(i+1) * output_width + (j+1)] = new_y;
-
-            // Calculate offset for U and V channels
-            int offset = (i / 2) * (output_width / 2) + (j / 2);
-            int offset2 = (i / 2) * (output_width / 2) + ((j + 1) / 2);
-            int offset3 = ((i+1) / 2) * (output_width / 2) + (j / 2);
-            int offset4 = ((i+1) / 2) * (output_width / 2) + ((j + 1) / 2);
-
-            uint8_t new_u = -u_lookup_red[red] - u_lookup_green[green] + u_lookup_blue[blue] + 128;
-            shared_yuv_buffer[output_total + offset] = new_u;
-            shared_yuv_buffer[output_total + offset2] = new_u;
-            shared_yuv_buffer[output_total + offset3] = new_u;
-            shared_yuv_buffer[output_total + offset4] = new_u;
-
-            uint8_t new_v = v_lookup_red[red] - v_lookup_green[green] - v_lookup_blue[blue] + 128;
-            shared_yuv_buffer[output_total + output_total / 4 + offset] = new_v;
-            shared_yuv_buffer[output_total + output_total / 4 + offset2] = new_v;
-            shared_yuv_buffer[output_total + output_total / 4 + offset3] = new_v;
-            shared_yuv_buffer[output_total + output_total / 4 + offset4] = new_v;
+            // U & V — one value per 2x2 block
+            U_row[x_input] = (uint8_t)(128 + u_pos_lookup_blue[b]
+                                           - u_neg_lookup_red[r]
+                                           - u_neg_lookup_green[g]);
+            V_row[x_input] = (uint8_t)(128 + v_pos_lookup_red[r]
+                                           - v_neg_lookup_green[g]
+                                           - v_neg_lookup_blue[b]);
         }
     }
 
-    // Record end time
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    // Signal consumer that a complete frame is ready (prevents torn reads)
+    uint64_t one = 1;
+    write(frame_ready_fd, &one, sizeof(one));
 
-    // Calculate time taken
-    time_to_draw = (end_time.tv_sec - start_time.tv_sec) * 1000 + (end_time.tv_nsec - start_time.tv_nsec) / 1000000;
-
-    // printf("Frame drawn in %d ms\n", time_to_draw);
-
-    // check for changes in the key status
-    for (int i = 0; i < KEY_STATUS_SIZE; i++) {
-        if (key_status[i] != last_key_status[i]) {
-            if (key_status[i] == 1) { // key pressed
-                addKeyToQueue(1, i);
-            } else { // key released
-                addKeyToQueue(0, i);
+    // Check for key state changes — skip the per-byte loop entirely if nothing changed
+    if (memcmp(key_status, last_key_status, KEY_STATUS_SIZE) != 0) {
+        for (int i = 0; i < KEY_STATUS_SIZE; i++) {
+            if (key_status[i] != last_key_status[i]) {
+                addKeyToQueue(key_status[i] == 1 ? 1 : 0, i);
+                last_key_status[i] = key_status[i];
             }
-            last_key_status[i] = key_status[i];
         }
     }
 }
 
 void DG_SleepMs(uint32_t ms)
 {
-  usleep (ms * 1000);
+    usleep(ms * 1000);
 }
 
-uint32_t DG_GetTicksMs()
+uint32_t DG_GetTicksMs(void)
 {
-  struct timeval  tp;
-  struct timezone tzp;
-
-  gettimeofday(&tp, &tzp);
-
-  return (tp.tv_sec * 1000) + (tp.tv_usec / 1000); /* return milliseconds */
+    struct timeval tp;
+    struct timezone tzp;
+    gettimeofday(&tp, &tzp);
+    return (tp.tv_sec * 1000) + (tp.tv_usec / 1000);
 }
 
-void DG_SetWindowTitle(const char * title)
+void DG_SetWindowTitle(const char *title)
 {
-  printf("Setting window title");
+    printf("Setting window title: %s\n", title);
 }
 
 int main(int argc, char **argv)
 {
-  printf("Running doom!\n");
+    printf("Running doom!\n");
     doomgeneric_Create(argc, argv);
 
-    for (int i = 0; ; i++)
-    {
+    for (;;)
         doomgeneric_Tick();
-    }
-    
 
     return 0;
 }

@@ -1,0 +1,17 @@
+CC = arm-linux-gnueabi-gcc
+CFLAGS = -static -O3 -std=gnu99
+TARGET = doom
+
+# Exclude all platform backends except anyka, plus SDL/Allegro audio files
+EXCLUDED = doomgeneric_allegro.c doomgeneric_emscripten.c doomgeneric_linuxvt.c \
+           doomgeneric_sdl.c doomgeneric_soso.c doomgeneric_sosox.c \
+           doomgeneric_win.c doomgeneric_xlib.c \
+           i_sdlmusic.c i_sdlsound.c i_allegromusic.c i_allegrosound.c
+
+SRCS = $(filter-out $(EXCLUDED), $(wildcard *.c))
+
+all:
+	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET) -lm
+
+clean:
+	rm -f $(TARGET)
